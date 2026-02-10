@@ -9,3 +9,7 @@ src/geocode_cache.sqlite
 .venv/
 __pycache__/
 *.pyc
+
+# Generated dataset outputs (built in CI)
+public/data/*
+!public/data/.gitkeep
