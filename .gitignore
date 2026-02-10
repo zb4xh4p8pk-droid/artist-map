@@ -1,3 +1,11 @@
 src/geocode_cache.sqlite
 public/data/*
 !public/data/.gitkeep
+
+# Cache géocodage (généré)
+src/geocode_cache.sqlite
+
+# Environnements Python (optionnel)
+.venv/
+__pycache__/
+*.pyc
