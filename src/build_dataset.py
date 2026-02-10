@@ -105,7 +105,7 @@ def cache_get(conn: sqlite3.Connection, query: str) -> Optional[Tuple[float, flo
 def cache_put(conn: sqlite3.Connection, query: str, lat: float, lon: float, display_name: str) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO geocode_cache(query, lat, lon, display_name, updated_at) VALUES(?,?,?,?,?)",
-        (query, lat, lon, display_name, dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"),
+        (query, lat, lon, display_name, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")),
     )
     conn.commit()
 
@@ -286,7 +286,7 @@ def main() -> int:
     if args.max and args.max > 0:
         rows = rows[: args.max]
 
-    checked_at = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     audit_rows: List[Dict[str, Any]] = []
     features: List[Dict[str, Any]] = []
