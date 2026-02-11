@@ -405,9 +405,9 @@ def main() -> int:
         official_url = (row.get("official_url") or "").strip()
         soundcloud_url = (row.get("soundcloud_url") or "").strip()
  
-         # evidence-driven base (manual but proof-backed)
-         base_place = (row.get("base_place") or "").strip()
-         base_source_url = (row.get("base_source_url") or "").strip()
+        # evidence-driven base (manual but proof-backed)
+        base_place = (row.get("base_place") or "").strip()
+        base_source_url = (row.get("base_source_url") or "").strip()
 
 
         identity_status = IDENTITY_NOT_FOUND
@@ -505,7 +505,7 @@ def main() -> int:
 
  
          # 0) Evidence-driven base: explicit place string + proof URL (no inference)
-         if base_place:
+        if base_place:
              place_candidates.append(
                  PlaceCandidate(
                      place_label=base_place,
