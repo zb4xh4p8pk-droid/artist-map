@@ -1,412 +1,642 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 import argparse
 import csv
-import datetime as dt
 import json
+import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from bs4 import BeautifulSoup
 
-WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
-MUSICBRAINZ_WS = "https://musicbrainz.org/ws/2"
-NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+# -------------------------
+# Status vocabulary
+# -------------------------
+IDENTITY_OK = "ok"
+IDENTITY_AMBIGUOUS = "ambiguous"
+IDENTITY_NOT_FOUND = "not_found"
 
-DEFAULT_UA = "artist-map/0.1 (https://github.com/zb4xh4p8pk-droid/artist-map)"
-REQ_SLEEP_S = 1.05
+PLACE_OK = "ok"
+PLACE_NO_PLACE = "no_place"
+PLACE_GEOCODE_FAILED = "geocode_failed"
 
-WKT_POINT_RE = re.compile(r"Point\(([-0-9.]+)\s+([-0-9.]+)\)")
-
-PLACE_PRIORITY = [
-    ("residence", "P551"),   # place of residence
-    ("base",      "P159"),   # headquarters location
-    ("base",      "P276"),   # location
-    ("origin",    "P740"),   # location of formation
-    ("birthplace","P19"),    # place of birth
-]
-
-ACCEPTABLE_PLACE_INSTANCES = {
-    "Q515",       # city
-    "Q486972",    # human settlement
-    "Q3957",      # town
-    "Q532",       # village
-    "Q6256",      # country
-    "Q3624078",   # sovereign state
-    "Q5119",      # capital
-}
-
+# -------------------------
+# Place candidate model
+# -------------------------
 @dataclass
-class ArtistRow:
-    artist_input: str
-    mbid: str
-    qid: str
+class PlaceCandidate:
+    place_label: str
+    place_type: str          # base/residence/work_location/formation/hq/birthplace/unknown
+    confidence: str          # high/medium/low
+    source_kind: str         # bandcamp/wikidata/nominatim/...
+    evidence_url: str
+    evidence_note: str = ""
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 
-def http_get_json(url: str, params: Dict[str, Any], ua: str) -> Dict[str, Any]:
-    r = requests.get(url, params=params, headers={"User-Agent": ua}, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def sparql_json(query: str, ua: str) -> Dict[str, Any]:
-    r = requests.get(
-        WIKIDATA_SPARQL,
-        params={"format": "json", "query": query},
-        headers={"User-Agent": ua, "Accept": "application/sparql-results+json"},
-        timeout=30,
+# -------------------------
+# SQLite cache (HTTP + geocode)
+# -------------------------
+def db_connect(path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS http_cache (
+        url TEXT PRIMARY KEY,
+        status INTEGER,
+        fetched_at TEXT,
+        body BLOB
     )
-    r.raise_for_status()
-    return r.json()
-
-
-def parse_wkt_point(wkt: str) -> Optional[Tuple[float, float]]:
-    m = WKT_POINT_RE.search(wkt)
-    if not m:
-        return None
-    lon = float(m.group(1))
-    lat = float(m.group(2))
-    return lat, lon
-
-
-def init_cache(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS geocode_cache (
-            query TEXT PRIMARY KEY,
-            lat REAL,
-            lon REAL,
-            display_name TEXT,
-            updated_at TEXT
-        )
-        """
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS geocode_cache (
+        query TEXT PRIMARY KEY,
+        lat REAL,
+        lon REAL,
+        fetched_at TEXT
     )
+    """)
     conn.commit()
     return conn
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def cache_get(conn: sqlite3.Connection, query: str) -> Optional[Tuple[float, float, str]]:
-    cur = conn.execute("SELECT lat, lon, display_name FROM geocode_cache WHERE query = ?", (query,))
+def http_get_cached(
+    conn: sqlite3.Connection,
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    ttl_days: int = 30,
+    last_request_time: Optional[List[float]] = None,
+) -> Tuple[int, str]:
+    """
+    Returns (status_code, text_body). Uses a simple SQLite cache with TTL.
+    """
+    cur = conn.execute("SELECT status, fetched_at, body FROM http_cache WHERE url = ?", (url,))
     row = cur.fetchone()
-    if not row:
-        return None
-    return float(row[0]), float(row[1]), str(row[2])
+    if row:
+        status, fetched_at, body = row
+        try:
+            fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 86400.0
+        except Exception:
+            age_days = 1e9
+        if age_days <= ttl_days:
+            return int(status), (body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body))
 
+    # throttle
+    if last_request_time is not None:
+        dt = time.time() - last_request_time[0]
+        if dt < min_delay_s:
+            time.sleep(min_delay_s - dt)
 
-def cache_put(conn: sqlite3.Connection, query: str, lat: float, lon: float, display_name: str) -> None:
+    resp = session.get(url, headers=headers, timeout=30)
+    if last_request_time is not None:
+        last_request_time[0] = time.time()
+
+    text = resp.text
     conn.execute(
-        "INSERT OR REPLACE INTO geocode_cache(query, lat, lon, display_name, updated_at) VALUES(?,?,?,?,?)",
-        (query, lat, lon, display_name, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")),
+        "INSERT OR REPLACE INTO http_cache(url, status, fetched_at, body) VALUES (?, ?, ?, ?)",
+        (url, int(resp.status_code), utc_now_iso(), text.encode("utf-8")),
     )
     conn.commit()
+    return int(resp.status_code), text
 
-
-def nominatim_geocode(query: str, ua: str, conn: sqlite3.Connection) -> Optional[Tuple[float, float, str, str]]:
-    cached = cache_get(conn, query)
-    if cached:
-        lat, lon, display_name = cached
-        return lat, lon, display_name, "cache"
-
-    params = {"q": query, "format": "json", "limit": 1}
-    r = requests.get(NOMINATIM_SEARCH, params=params, headers={"User-Agent": ua}, timeout=30)
-    r.raise_for_status()
-    hits = r.json()
-    time.sleep(REQ_SLEEP_S)
-
-    if not hits:
+def geocode_nominatim(
+    conn: sqlite3.Connection,
+    session: requests.Session,
+    query: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    last_request_time: List[float],
+) -> Optional[Tuple[float, float]]:
+    query = query.strip()
+    if not query:
         return None
-    hit = hits[0]
-    lat = float(hit["lat"])
-    lon = float(hit["lon"])
-    display_name = hit.get("display_name", query)
-    cache_put(conn, query, lat, lon, display_name)
-    return lat, lon, display_name, "nominatim"
+
+    cur = conn.execute("SELECT lat, lon FROM geocode_cache WHERE query = ?", (query,))
+    row = cur.fetchone()
+    if row and row[0] is not None and row[1] is not None:
+        return float(row[0]), float(row[1])
+
+    dt = time.time() - last_request_time[0]
+    if dt < min_delay_s:
+        time.sleep(min_delay_s - dt)
+
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"format": "jsonv2", "q": query, "limit": 1}
+    resp = session.get(url, params=params, headers=headers, timeout=30)
+    last_request_time[0] = time.time()
+
+    if resp.status_code != 200:
+        conn.execute(
+            "INSERT OR REPLACE INTO geocode_cache(query, lat, lon, fetched_at) VALUES (?, ?, ?, ?)",
+            (query, None, None, utc_now_iso()),
+        )
+        conn.commit()
+        return None
+
+    data = resp.json()
+    if not data:
+        conn.execute(
+            "INSERT OR REPLACE INTO geocode_cache(query, lat, lon, fetched_at) VALUES (?, ?, ?, ?)",
+            (query, None, None, utc_now_iso()),
+        )
+        conn.commit()
+        return None
+
+    lat = float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    conn.execute(
+        "INSERT OR REPLACE INTO geocode_cache(query, lat, lon, fetched_at) VALUES (?, ?, ?, ?)",
+        (query, lat, lon, utc_now_iso()),
+    )
+    conn.commit()
+    return lat, lon
 
 
-def mb_artist_urls(mbid: str, ua: str) -> List[str]:
-    url = f"{MUSICBRAINZ_WS}/artist/{mbid}"
-    params = {"fmt": "json", "inc": "url-rels"}
-    data = http_get_json(url, params=params, ua=ua)
-    rels = data.get("relations") or []
-    out: List[str] = []
-    for rel in rels:
-        u = (rel.get("url") or {}).get("resource")
-        if u:
-            out.append(u)
+# -------------------------
+# Bandcamp extraction
+# -------------------------
+def extract_bandcamp_location(html: str, artist_input: str) -> Optional[str]:
+    """
+    Tries multiple strategies to extract 'City, Country' from a Bandcamp artist page.
+    Returns a location string or None.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Common header block: <p id="band-name-location"> ... <span class="location">Lyon, France</span>
+    p = soup.find(id="band-name-location")
+    if p:
+        loc = p.get_text(" ", strip=True)
+        # Often "ArtistName Lyon, France" -> remove artist name prefix if present
+        if artist_input:
+            loc = re.sub(r"^\s*" + re.escape(artist_input) + r"\s+", "", loc, flags=re.IGNORECASE)
+        # Try to keep only the last "City, Country" segment
+        m = re.search(r"([A-Za-zÀ-ÿ0-9 .'\-]+,\s*[A-Za-zÀ-ÿ .'\-]+)\s*$", loc)
+        if m:
+            return m.group(1).strip()
+        if loc:
+            return loc.strip()
+
+    # Fallback: look for any span.location
+    sp = soup.find("span", class_=re.compile(r"\blocation\b"))
+    if sp:
+        loc = sp.get_text(" ", strip=True)
+        if loc:
+            return loc.strip()
+
+    # Fallback: regex in raw HTML for "location":"Lyon, France"
+    m = re.search(r'"location"\s*:\s*"([^"]{2,80})"', html)
+    if m:
+        loc = m.group(1).strip()
+        if loc:
+            return loc
+
+    return None
+
+
+# -------------------------
+# MusicBrainz identity pivot
+# -------------------------
+def mb_request(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    last_request_time: List[float],
+    params: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    dt = time.time() - last_request_time[0]
+    if dt < min_delay_s:
+        time.sleep(min_delay_s - dt)
+    resp = session.get(url, params=params, headers=headers, timeout=30)
+    last_request_time[0] = time.time()
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+def mb_search_artist(
+    session: requests.Session,
+    name: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    last_request_time: List[float],
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    url = "https://musicbrainz.org/ws/2/artist/"
+    q = f'artist:"{name}"'
+    data = mb_request(session, url, headers, min_delay_s, last_request_time, params={"query": q, "fmt": "json", "limit": str(limit)})
+    if not data:
+        return []
+    return data.get("artists", []) or []
+
+def mb_get_artist(
+    session: requests.Session,
+    mbid: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    last_request_time: List[float],
+) -> Optional[Dict[str, Any]]:
+    url = f"https://musicbrainz.org/ws/2/artist/{mbid}"
+    return mb_request(session, url, headers, min_delay_s, last_request_time, params={"fmt": "json", "inc": "url-rels+aliases"})
+
+def mb_extract_urls(mb_artist: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    rels = mb_artist.get("relations", []) or []
+    for r in rels:
+        if r.get("target-type") != "url":
+            continue
+        u = (r.get("url") or {}).get("resource") or ""
+        t = (r.get("type") or "").lower()
+        if not u:
+            continue
+        if "wikidata.org" in u:
+            out.setdefault("wikidata_url", u)
+        if "bandcamp.com" in u:
+            out.setdefault("bandcamp_url", u)
+        if "soundcloud.com" in u:
+            out.setdefault("soundcloud_url", u)
+        if t in ("official homepage", "homepage") or ("http" in u and "bandcamp.com" not in u and "wikidata.org" not in u and "soundcloud.com" not in u):
+            out.setdefault("official_url", u)
+    return out
+
+def qid_from_wikidata_url(url: str) -> Optional[str]:
+    m = re.search(r"/wiki/(Q\d+)", url)
+    return m.group(1) if m else None
+
+
+# -------------------------
+# Wikidata places (EntityData JSON)
+# -------------------------
+def wd_entity_json(
+    session: requests.Session,
+    qid: str,
+    headers: Dict[str, str],
+    min_delay_s: float,
+    last_request_time: List[float],
+) -> Optional[Dict[str, Any]]:
+    dt = time.time() - last_request_time[0]
+    if dt < min_delay_s:
+        time.sleep(min_delay_s - dt)
+    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+    resp = session.get(url, headers=headers, timeout=30)
+    last_request_time[0] = time.time()
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+def wd_label_and_coords(entity_data: Dict[str, Any], qid: str) -> Tuple[Optional[str], Optional[Tuple[float, float]]]:
+    ent = (entity_data.get("entities") or {}).get(qid) or {}
+    labels = ent.get("labels") or {}
+    label = None
+    if "en" in labels:
+        label = labels["en"].get("value")
+    elif labels:
+        label = next(iter(labels.values())).get("value")
+
+    claims = ent.get("claims") or {}
+    coords = None
+    if "P625" in claims:
+        snaks = claims["P625"]
+        if snaks:
+            dv = (((snaks[0].get("mainsnak") or {}).get("datavalue") or {}).get("value") or {})
+            if isinstance(dv, dict) and "latitude" in dv and "longitude" in dv:
+                coords = (float(dv["latitude"]), float(dv["longitude"]))
+    return label, coords
+
+def wd_extract_place_qids(entity_data: Dict[str, Any], subject_qid: str) -> List[Tuple[str, str]]:
+    """
+    Returns list of (place_qid, place_type) in priority order.
+    """
+    ent = (entity_data.get("entities") or {}).get(subject_qid) or {}
+    claims = ent.get("claims") or {}
+
+    # priority order (your hierarchy for structured sources)
+    props = [
+        ("P551", "residence"),
+        ("P937", "work_location"),
+        ("P740", "formation"),
+        ("P159", "hq"),
+        ("P19", "birthplace"),
+    ]
+
+    out: List[Tuple[str, str]] = []
+    for pid, ptype in props:
+        for c in claims.get(pid, []) or []:
+            ms = c.get("mainsnak") or {}
+            dv = (ms.get("datavalue") or {}).get("value") or {}
+            if isinstance(dv, dict) and "id" in dv and str(dv["id"]).startswith("Q"):
+                out.append((str(dv["id"]), ptype))
     return out
 
 
-def extract_wikidata_qid(urls: List[str]) -> str:
-    for u in urls:
-        m = re.search(r"wikidata\.org/wiki/(Q\d+)", u)
-        if m:
-            return m.group(1)
-    return ""
+# -------------------------
+# Main pipeline
+# -------------------------
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-
-def wikidata_search_qid(label: str, ua: str, lang: str = "fr") -> str:
-    params = {
-        "action": "wbsearchentities",
-        "search": label,
-        "language": lang,
-        "format": "json",
-        "limit": 5,
-        "type": "item",
-    }
-    data = http_get_json(WIKIDATA_API, params=params, ua=ua)
-    hits = data.get("search") or []
-    if not hits:
-        return ""
-    return hits[0].get("id") or ""
-
-
-def qid_url(qid: str) -> str:
-    return f"https://www.wikidata.org/wiki/{qid}"
-
-
-def wd_get_best_place(qid: str, ua: str) -> Tuple[str, str, str]:
-    for place_type, prop in PLACE_PRIORITY:
-        query = f"""
-        SELECT ?place ?placeLabel WHERE {{
-          wd:{qid} wdt:{prop} ?place .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "fr,en". }}
-        }} LIMIT 1
-        """
-        data = sparql_json(query, ua=ua)
-        time.sleep(REQ_SLEEP_S)
-        bindings = data.get("results", {}).get("bindings", [])
-        if bindings:
-            place_uri = bindings[0]["place"]["value"]
-            place_qid = place_uri.rsplit("/", 1)[-1]
-            place_label = bindings[0]["placeLabel"]["value"]
-            return place_qid, place_label, place_type
-    return "", "", "unknown"
-
-
-def wd_place_details(place_qid: str, ua: str) -> Tuple[Optional[Tuple[float, float]], List[str], str]:
-    query = f"""
-    SELECT ?coord ?inst ?label WHERE {{
-      OPTIONAL {{ wd:{place_qid} wdt:P625 ?coord. }}
-      OPTIONAL {{ wd:{place_qid} wdt:P31 ?inst. }}
-      SERVICE wikibase:label {{
-        bd:serviceParam wikibase:language "fr,en".
-        wd:{place_qid} rdfs:label ?label.
-      }}
-    }}
-    """
-    data = sparql_json(query, ua=ua)
-    time.sleep(REQ_SLEEP_S)
-    bindings = data.get("results", {}).get("bindings", [])
-
-    coords = None
-    insts: List[str] = []
-    label = place_qid
-
-    for b in bindings:
-        if "coord" in b and coords is None:
-            coords = parse_wkt_point(b["coord"]["value"])
-        if "inst" in b:
-            inst_uri = b["inst"]["value"]
-            insts.append(inst_uri.rsplit("/", 1)[-1])
-        if "label" in b:
-            label = b["label"]["value"]
-
-    return coords, sorted(set(insts)), label
-
-
-def wd_admin_fallback(place_qid: str, ua: str, max_hops: int = 4) -> str:
-    current = place_qid
-    for _ in range(max_hops):
-        coords, insts, _ = wd_place_details(current, ua=ua)
-        if coords is not None or any(i in ACCEPTABLE_PLACE_INSTANCES for i in insts):
-            return current
-
-        query = f"SELECT ?admin WHERE {{ wd:{current} wdt:P131 ?admin . }} LIMIT 1"
-        data = sparql_json(query, ua=ua)
-        time.sleep(REQ_SLEEP_S)
-        bindings = data.get("results", {}).get("bindings", [])
-        if not bindings:
-            return current
-        admin_uri = bindings[0]["admin"]["value"]
-        current = admin_uri.rsplit("/", 1)[-1]
-    return current
-
-
-def read_input_csv(path: Path) -> List[ArtistRow]:
-    rows: List[ArtistRow] = []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for line in reader:
-            artist_input = (line.get("artist_input") or "").strip()
-            if not artist_input:
-                continue
-            mbid = (line.get("mbid") or "").strip()
-            qid = (line.get("qid") or "").strip()
-            rows.append(ArtistRow(artist_input=artist_input, mbid=mbid, qid=qid))
-    return rows
-
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="artists.csv")
+    ap.add_argument("--out", default="public/data")
+    ap.add_argument("--max", type=int, default=0)
+    ap.add_argument("--user-agent", default="artist-map/0.2 (contact: unknown)")
+    ap.add_argument("--mb-delay", type=float, default=1.05)
+    ap.add_argument("--nominatim-delay", type=float, default=1.05)
+    ap.add_argument("--wd-delay", type=float, default=0.3)
+    ap.add_argument("--cache-db", default="src/geocode_cache.sqlite")
+    ap.add_argument("--verbose", action="store_true")
+    return ap.parse_args()
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="", help="CSV input (défaut: artists.csv puis artistes.csv)")
-    ap.add_argument("--outdir", default="public/data", help="dossier de sortie")
-    ap.add_argument("--ua", default=DEFAULT_UA, help="User-Agent HTTP")
-    ap.add_argument("--max", type=int, default=0, help="limiter à N artistes (debug)")
-    args = ap.parse_args()
+    args = parse_args()
 
-    repo_root = Path(__file__).resolve().parents[1]
+    headers = {
+        "User-Agent": args.user_agent,
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+    }
 
-    if args.input:
-        input_csv = (repo_root / args.input).resolve()
-    else:
-        c1 = repo_root / "artists.csv"
-        c2 = repo_root / "artistes.csv"
-        input_csv = c1 if c1.exists() else c2
+    conn = db_connect(args.cache_db)
+    session = requests.Session()
 
-    outdir = (repo_root / args.outdir).resolve()
-    ensure_dir(outdir)
+    mb_last = [0.0]
+    nom_last = [0.0]
+    wd_last = [0.0]
+    http_last = [0.0]
 
-    cache_path = (repo_root / "src" / "geocode_cache.sqlite").resolve()
-    conn = init_cache(cache_path)
+    # read input
+    with open(args.input, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
 
-    rows = read_input_csv(input_csv)
     if args.max and args.max > 0:
         rows = rows[: args.max]
 
-    checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    ensure_dir(args.out)
 
-    audit_rows: List[Dict[str, Any]] = []
     features: List[Dict[str, Any]] = []
+    audit_rows: List[Dict[str, Any]] = []
 
     for row in rows:
-        sources: List[str] = []
-        confidence = "faible"
+        artist_input = (row.get("artist_input") or "").strip()
+        qid = (row.get("qid") or "").strip()
+        mbid = (row.get("mbid") or "").strip()
 
-        qid = row.qid.strip()
+        # optional pivots
+        bandcamp_url = (row.get("bandcamp_url") or "").strip()
+        official_url = (row.get("official_url") or "").strip()
+        soundcloud_url = (row.get("soundcloud_url") or "").strip()
 
-        if not qid and row.mbid:
-            try:
-                urls = mb_artist_urls(row.mbid, ua=args.ua)
-                sources.append(f"https://musicbrainz.org/artist/{row.mbid}")
-                qid = extract_wikidata_qid(urls)
-                time.sleep(REQ_SLEEP_S)
-                if qid:
-                    confidence = "moyen"
-            except Exception:
-                pass
+        identity_status = IDENTITY_NOT_FOUND
+        identity_reason = ""
+        identity_confidence = "low"
+        chosen_qid = qid
+        chosen_mbid = mbid
 
-        if not qid:
-            try:
-                qid = wikidata_search_qid(row.artist_input, ua=args.ua, lang="fr")
-                time.sleep(REQ_SLEEP_S)
-                if qid:
-                    confidence = "faible"
-            except Exception:
-                qid = ""
+        evidence_urls: List[str] = []
 
-        if qid:
-            sources.append(qid_url(qid))
-            if row.qid:
-                confidence = "élevé"
+        # ---- Identity resolution
+        mb_artist = None
+        candidates_brief = ""
 
-        place_qid, place_label, place_type = ("", "", "unknown")
-        if qid:
-            try:
-                place_qid, place_label, place_type = wd_get_best_place(qid, ua=args.ua)
-            except Exception:
-                place_qid, place_label, place_type = ("", "", "unknown")
+        if chosen_qid:
+            identity_status = IDENTITY_OK
+            identity_confidence = "high"
+            identity_reason = "qid provided"
+        else:
+            if chosen_mbid:
+                mb_artist = mb_get_artist(session, chosen_mbid, headers, args.mb_delay, mb_last)
+                if mb_artist:
+                    identity_status = IDENTITY_OK
+                    identity_confidence = "high"
+                    identity_reason = "mbid provided"
+                else:
+                    identity_status = IDENTITY_NOT_FOUND
+                    identity_reason = "mbid provided but MusicBrainz fetch failed"
+            else:
+                # name search on MusicBrainz (may be ambiguous)
+                if artist_input:
+                    cands = mb_search_artist(session, artist_input, headers, args.mb_delay, mb_last, limit=3)
+                    if cands:
+                        # check best candidate
+                        cands_sorted = sorted(cands, key=lambda x: int(x.get("score", 0)), reverse=True)
+                        best = cands_sorted[0]
+                        best_score = int(best.get("score", 0))
+                        second_score = int(cands_sorted[1].get("score", 0)) if len(cands_sorted) > 1 else -1
+                        best_name = (best.get("name") or "").strip()
+                        best_id = (best.get("id") or "").strip()
+                        candidates_brief = "; ".join([f'{(c.get("name") or "").strip()}|{c.get("id")}|{c.get("score")}' for c in cands_sorted])
 
-        lat = lon = None
-        place_source = ""
-        final_place_qid = ""
+                        # strict auto-pick only if strong
+                        if best_id and best_score >= 95 and (best_score - second_score) >= 5 and best_name.lower() == artist_input.lower():
+                            chosen_mbid = best_id
+                            mb_artist = mb_get_artist(session, chosen_mbid, headers, args.mb_delay, mb_last)
+                            if mb_artist:
+                                identity_status = IDENTITY_OK
+                                identity_confidence = "medium"
+                                identity_reason = "MusicBrainz name search strong match"
+                            else:
+                                identity_status = IDENTITY_NOT_FOUND
+                                identity_reason = "MusicBrainz candidate fetch failed"
+                        else:
+                            identity_status = IDENTITY_AMBIGUOUS if len(cands_sorted) > 1 else IDENTITY_NOT_FOUND
+                            identity_reason = "MusicBrainz name search ambiguous; provide mbid/qid or pivot URL"
+                    else:
+                        identity_status = IDENTITY_NOT_FOUND
+                        identity_reason = "MusicBrainz name search returned nothing"
+                else:
+                    identity_status = IDENTITY_NOT_FOUND
+                    identity_reason = "empty artist_input"
 
-        if place_qid:
-            try:
-                final_place_qid = wd_admin_fallback(place_qid, ua=args.ua)
-                coords, _, final_label = wd_place_details(final_place_qid, ua=args.ua)
-                place_label = final_label or place_label
-                if coords:
-                    lat, lon = coords
-                    place_source = "wikidata"
-            except Exception:
-                pass
+        # If we have MB artist data, extract pivots (bandcamp/wikidata/etc.)
+        if mb_artist:
+            url_pivots = mb_extract_urls(mb_artist)
+            if not bandcamp_url:
+                bandcamp_url = url_pivots.get("bandcamp_url", "") or bandcamp_url
+            if not official_url:
+                official_url = url_pivots.get("official_url", "") or official_url
+            if not soundcloud_url:
+                soundcloud_url = url_pivots.get("soundcloud_url", "") or soundcloud_url
+            if not chosen_qid:
+                wdu = url_pivots.get("wikidata_url", "")
+                q = qid_from_wikidata_url(wdu) if wdu else None
+                if q:
+                    chosen_qid = q
 
-        if (lat is None or lon is None) and place_label:
-            try:
-                geo = nominatim_geocode(place_label, ua=args.ua, conn=conn)
-                if geo:
-                    lat, lon, disp, src = geo
-                    place_source = src
-                    place_label = disp
-                    sources.append(
-                        f"{NOMINATIM_SEARCH}?q={requests.utils.quote(place_label)}&format=json&limit=1"
+        # Pivot URLs (if present) are identity locks
+        if bandcamp_url:
+            evidence_urls.append(bandcamp_url)
+        if official_url:
+            evidence_urls.append(official_url)
+        if soundcloud_url:
+            evidence_urls.append(soundcloud_url)
+
+        if identity_status != IDENTITY_OK and (bandcamp_url or official_url or soundcloud_url):
+            # A provided pivot URL is treated as a practical identity lock
+            identity_status = IDENTITY_OK
+            identity_confidence = "medium"
+            identity_reason = "pivot URL provided (bandcamp/official/soundcloud)"
+
+        # ---- Place extraction (hierarchy: Wikidata then Bandcamp as per your strict execution, but for niche we prioritize Bandcamp if provided)
+        place_candidates: List[PlaceCandidate] = []
+
+        # 1) Wikidata (structured) if QID available
+        if chosen_qid and identity_status == IDENTITY_OK:
+            wd = wd_entity_json(session, chosen_qid, headers, args.wd_delay, wd_last)
+            if wd:
+                for pqid, ptype in wd_extract_place_qids(wd, chosen_qid):
+                    wd_place = wd_entity_json(session, pqid, headers, args.wd_delay, wd_last)
+                    if not wd_place:
+                        continue
+                    label, coords = wd_label_and_coords(wd_place, pqid)
+                    if not label:
+                        continue
+                    latlon = coords
+                    place_candidates.append(
+                        PlaceCandidate(
+                            place_label=label,
+                            place_type=ptype,
+                            confidence="medium",
+                            source_kind="wikidata",
+                            evidence_url=f"https://www.wikidata.org/wiki/{chosen_qid}",
+                            evidence_note=f"{ptype} -> {pqid}",
+                            lat=(latlon[0] if latlon else None),
+                            lon=(latlon[1] if latlon else None),
+                        )
                     )
-            except Exception:
-                pass
 
-        if lat is None or lon is None:
-            place_type = "unknown"
-            confidence = "faible"
+        # 2) Bandcamp profile (niche-coverage, explicit city/country shown on profile)
+        if bandcamp_url and identity_status == IDENTITY_OK:
+            status, html = http_get_cached(conn, session, bandcamp_url, headers, min_delay_s=0.5, ttl_days=14, last_request_time=http_last)
+            if status == 200 and html:
+                loc = extract_bandcamp_location(html, artist_input)
+                if loc:
+                    place_candidates.append(
+                        PlaceCandidate(
+                            place_label=loc,
+                            place_type="base",
+                            confidence="medium",
+                            source_kind="bandcamp",
+                            evidence_url=bandcamp_url,
+                            evidence_note="profile location",
+                        )
+                    )
 
-        props = {
-            "artist_input": row.artist_input,
-            "qid": qid,
-            "mbid": row.mbid,
-            "place_label": place_label,
-            "place_qid": final_place_qid,
-            "place_type": place_type,
-            "confidence": confidence,
-            "place_source": place_source,
-            "sources": sources,
-            "checked_at": checked_at,
-        }
-        audit_rows.append(props)
+        # pick best candidate:
+        # - Prefer Bandcamp base (explicit profile location) when present
+        # - Else prefer Wikidata in priority order already appended (residence/work/formation/hq/birthplace)
+        chosen: Optional[PlaceCandidate] = None
+        for c in place_candidates:
+            if c.source_kind == "bandcamp" and c.place_type == "base":
+                chosen = c
+                break
+        if chosen is None and place_candidates:
+            chosen = place_candidates[0]
 
-        if lat is not None and lon is not None:
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                    "properties": props,
-                }
-            )
+        place_status = PLACE_NO_PLACE
+        place_reason = ""
+        lat = lon = None
 
-    geojson = {"type": "FeatureCollection", "features": features}
-    (outdir / "artists.geojson").write_text(
-        json.dumps(geojson, ensure_ascii=False), encoding="utf-8"
-    )
+        if not chosen:
+            place_status = PLACE_NO_PLACE
+            place_reason = "No place candidate (need qid/mbid or pivot URL like bandcamp_url)."
+        else:
+            # ensure coords
+            if chosen.lat is not None and chosen.lon is not None:
+                lat, lon = chosen.lat, chosen.lon
+                place_status = PLACE_OK
+            else:
+                latlon = geocode_nominatim(conn, session, chosen.place_label, headers, args.nominatim_delay, nom_last)
+                if latlon:
+                    lat, lon = latlon
+                    place_status = PLACE_OK
+                else:
+                    place_status = PLACE_GEOCODE_FAILED
+                    place_reason = f"Geocoding failed for {chosen.place_label!r}"
 
-    audit_path = outdir / "artists.csv"
-    fieldnames = [
-        "artist_input", "qid", "mbid",
-        "place_label", "place_qid", "place_type",
-        "confidence", "place_source", "checked_at", "sources",
-    ]
-    with audit_path.open("w", encoding="utf-8", newline="") as f:
+        # build feature if ok
+        if place_status == PLACE_OK and lat is not None and lon is not None:
+            feat = {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {
+                    "artist_input": artist_input,
+                    "qid": chosen_qid,
+                    "mbid": chosen_mbid,
+                    "place_label": chosen.place_label if chosen else "",
+                    "place_type": chosen.place_type if chosen else "unknown",
+                    "confidence": chosen.confidence if chosen else "low",
+                    "source_kind": chosen.source_kind if chosen else "",
+                    "evidence_url": chosen.evidence_url if chosen else "",
+                    "identity_confidence": identity_confidence,
+                    "identity_reason": identity_reason,
+                },
+            }
+            features.append(feat)
+
+        audit_rows.append({
+            "artist_input": artist_input,
+            "qid": chosen_qid,
+            "mbid": chosen_mbid,
+            "bandcamp_url": bandcamp_url,
+            "official_url": official_url,
+            "soundcloud_url": soundcloud_url,
+            "identity_status": identity_status,
+            "identity_confidence": identity_confidence,
+            "identity_reason": identity_reason,
+            "mb_candidates": candidates_brief,
+            "place_status": place_status,
+            "place_reason": place_reason,
+            "chosen_place_label": chosen.place_label if chosen else "",
+            "chosen_place_type": chosen.place_type if chosen else "",
+            "chosen_source_kind": chosen.source_kind if chosen else "",
+            "chosen_evidence_url": chosen.evidence_url if chosen else "",
+            "lat": lat if lat is not None else "",
+            "lon": lon if lon is not None else "",
+        })
+
+        if args.verbose:
+            print(f"[{identity_status}/{place_status}] {artist_input} | qid={chosen_qid or '-'} mbid={chosen_mbid or '-'} | place={chosen.place_label if chosen else '-'} | {place_reason or identity_reason}")
+
+    # write outputs
+    geo = {"type": "FeatureCollection", "features": features}
+    out_geo = os.path.join(args.out, "artists.geojson")
+    out_csv = os.path.join(args.out, "artists.csv")
+
+    with open(out_geo, "w", encoding="utf-8") as f:
+        json.dump(geo, f, ensure_ascii=False, indent=2)
+
+    # audit csv
+    fieldnames = list(audit_rows[0].keys()) if audit_rows else []
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in audit_rows:
-            rr = dict(r)
-            rr["sources"] = " | ".join(r.get("sources", []))
-            w.writerow({k: rr.get(k, "") for k in fieldnames})
+            w.writerow(r)
 
-    print(f"[OK] Wrote: {outdir / 'artists.geojson'}")
-    print(f"[OK] Wrote: {audit_path}")
+    counts_id = Counter(r["identity_status"] for r in audit_rows)
+    counts_pl = Counter(r["place_status"] for r in audit_rows)
+    print("[OK] Wrote:", out_geo)
+    print("[OK] Wrote:", out_csv)
+    print("[SUMMARY] identity_status:", dict(counts_id))
+    print("[SUMMARY] place_status:", dict(counts_pl))
+    print("[SUMMARY] features:", len(features))
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
