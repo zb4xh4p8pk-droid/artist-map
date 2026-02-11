@@ -1,3 +1,3 @@
-artist_input,qid,mbid,bandcamp_url,official_url,soundcloud_url
-Vardae,,,https://vardae.bandcamp.com/music,,
-Adhémar,,,https://adhemar.bandcamp.com/ ,,
+artist_input,qid,mbid,base_place,base_source_url
+Vardae,,,Lyon, France,https://vardae.bandcamp.com/music
+Adhémar,,,Paris, France,https://adhemar.bandcamp.com/
