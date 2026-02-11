@@ -3,15 +3,7 @@ name: Deploy GitHub Pages (static)
 on:
   push:
     branches: ["main"]
-    paths:
-      - "artists.csv"
-      - "src/**"
-      - "public/**"
-      - "requirements.txt"
-      - ".github/workflows/build_and_deploy.yml"
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 * * 0"
 
 permissions:
   contents: read
@@ -26,30 +18,24 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Build dataset
-        run: |
+      - run: |
           python src/build_dataset.py \
             --input artists.csv \
             --out public/data \
             --user-agent "artist-map/0.2 (https://github.com/${{ github.repository }})"
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v5
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
@@ -60,6 +46,5 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v4
