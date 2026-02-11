@@ -236,6 +236,7 @@ def mb_search_artist(
     min_delay_s: float,
     last_request_time: List[float],
     limit: int = 3,
+
 ) -> List[Dict[str, Any]]:
     url = "https://musicbrainz.org/ws/2/artist/"
     q = f'artist:"{name}"'
@@ -403,6 +404,11 @@ def main() -> int:
         bandcamp_url = (row.get("bandcamp_url") or "").strip()
         official_url = (row.get("official_url") or "").strip()
         soundcloud_url = (row.get("soundcloud_url") or "").strip()
+ 
+         # evidence-driven base (manual but proof-backed)
+         base_place = (row.get("base_place") or "").strip()
+         base_source_url = (row.get("base_source_url") or "").strip()
+
 
         identity_status = IDENTITY_NOT_FOUND
         identity_reason = ""
@@ -496,6 +502,21 @@ def main() -> int:
 
         # ---- Place extraction (hierarchy: Wikidata then Bandcamp as per your strict execution, but for niche we prioritize Bandcamp if provided)
         place_candidates: List[PlaceCandidate] = []
+
+ 
+         # 0) Evidence-driven base: explicit place string + proof URL (no inference)
+         if base_place:
+             place_candidates.append(
+                 PlaceCandidate(
+                     place_label=base_place,
+                     place_type="base",
+                     confidence="medium",
+                     source_kind="evidence",
+                     evidence_url=(base_source_url or bandcamp_url or official_url or ""),
+                     evidence_note="base_place provided (proof-backed manual entry)",
+                 )
+             )
+
 
         # 1) Wikidata (structured) if QID available
         if chosen_qid and identity_status == IDENTITY_OK:
@@ -598,6 +619,8 @@ def main() -> int:
             "bandcamp_url": bandcamp_url,
             "official_url": official_url,
             "soundcloud_url": soundcloud_url,
+            "base_place": base_place,
+            "base_source_url": base_source_url,
             "identity_status": identity_status,
             "identity_confidence": identity_confidence,
             "identity_reason": identity_reason,
